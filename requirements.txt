@@ -1,0 +1,4 @@
+daytona
+fastapi
+pydantic-settings
+uvicorn[standard]
