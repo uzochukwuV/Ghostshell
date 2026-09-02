@@ -9,13 +9,13 @@ from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger("daytona-codex")
 
-DEFAULT_TOKEN_ROUTER_URL = "https://api.tokenrouter.com/v1"
-DEFAULT_CODEX_MODEL = "z-ai/glm-5.3-free"
+DEFAULT_OPENROUTER_URL = "https://openrouter.ai/api/v1/"
+DEFAULT_CODEX_MODEL = "z-ai/glm-5.2:free"
 
 
 class PromptRequest(BaseModel):
@@ -51,25 +51,24 @@ class DaytonaSandboxManager:
         if not api_key:
             raise RuntimeError("DAYTONA_API_KEY is not configured")
         return {
-            "token_router_url": os.getenv(
-                "TOKEN_ROUTER_BASE_URL", DEFAULT_TOKEN_ROUTER_URL
-            ),
+            "provider_url": os.getenv("CODEX_BASE_URL", DEFAULT_OPENROUTER_URL),
             "model": os.getenv("CODEX_MODEL", DEFAULT_CODEX_MODEL),
-            "token_router_key": os.getenv("TOKEN_ROUTER_API_KEY", ""),
+            "provider_key": os.getenv("OPENROUTER_KEY")
+            or os.getenv("TOKEN_ROUTER_API_KEY", ""),
         }
 
     def status(self) -> dict[str, Any]:
         return {
             "configured": bool(
-                os.getenv("DAYTONA_API_KEY") and os.getenv("TOKEN_ROUTER_API_KEY")
+                os.getenv("DAYTONA_API_KEY")
+                and (os.getenv("OPENROUTER_KEY") or os.getenv("TOKEN_ROUTER_API_KEY"))
             ),
             "sandbox_created": self.sandbox is not None,
             "sandbox_id": self.sandbox_id,
             "bootstrap_complete": self.bootstrap_complete,
+            "provider": "openrouter",
             "model": os.getenv("CODEX_MODEL", DEFAULT_CODEX_MODEL),
-            "token_router_base_url": os.getenv(
-                "TOKEN_ROUTER_BASE_URL", DEFAULT_TOKEN_ROUTER_URL
-            ),
+            "provider_base_url": os.getenv("CODEX_BASE_URL", DEFAULT_OPENROUTER_URL),
         }
 
     def _record(self, kind: str, text: str, exit_code: int | None) -> dict[str, Any]:
@@ -131,7 +130,7 @@ class DaytonaSandboxManager:
 
             settings = self._settings()
             model_toml = json.dumps(settings["model"])
-            base_url_toml = json.dumps(settings["token_router_url"])
+            base_url_toml = json.dumps(settings["provider_url"])
             bootstrap_code = r"""
 import json
 import os
@@ -176,17 +175,19 @@ config_dir = os.path.expanduser("~/.codex")
 os.makedirs(config_dir, exist_ok=True)
 with open(os.path.join(config_dir, "config.toml"), "w", encoding="utf-8") as config_file:
     config_file.write('model = __MODEL_TOML__\n')
-    config_file.write('model_provider = "tokenrouter"\n')
+    config_file.write('model_provider = "openrouter"\n')
     config_file.write('approval_policy = "never"\n')
     config_file.write('sandbox_mode = "workspace-write"\n')
-    config_file.write("\n[model_providers.tokenrouter]\n")
-    config_file.write('name = "Token Router"\n')
+    config_file.write("\n[model_providers.openrouter]\n")
+    config_file.write('name = "OpenRouter"\n')
     config_file.write('base_url = __BASE_URL_TOML__\n')
     config_file.write('env_key = "OPENAI_API_KEY"\n')
     config_file.write('wire_api = "responses"\n')
     config_file.write("supports_websockets = false\n")
 
 print(json.dumps({"steps": results, "codex_home": config_dir}))
+critical_exit_codes = [results[-2]["exit_code"], results[-1]["exit_code"]]
+raise SystemExit(0 if all(code == 0 for code in critical_exit_codes) else 1)
 """.replace("__MODEL_TOML__", model_toml).replace(
                 "__BASE_URL_TOML__", base_url_toml
             )
@@ -216,8 +217,8 @@ print(json.dumps({"steps": results, "codex_home": config_dir}))
 
             settings = self._settings()
             prompt_json = json.dumps(prompt)
-            base_url_json = json.dumps(settings["token_router_url"])
-            key_json = json.dumps(settings["token_router_key"])
+            base_url_json = json.dumps(settings["provider_url"])
+            key_json = json.dumps(settings["provider_key"])
             model_json = json.dumps(settings["model"])
             code = f"""
 import os
@@ -232,12 +233,12 @@ command = [
     "codex", "exec",
     "--skip-git-repo-check",
     "--sandbox", "workspace-write",
-    "--config", 'model_provider="tokenrouter"',
-    "--config", 'model_providers.tokenrouter.name="Token Router"',
-    "--config", "model_providers.tokenrouter.base_url=" + {base_url_json},
-    "--config", 'model_providers.tokenrouter.env_key="OPENAI_API_KEY"',
-    "--config", 'model_providers.tokenrouter.wire_api="responses"',
-    "--config", "model_providers.tokenrouter.supports_websockets=false",
+    "--config", 'model_provider="openrouter"',
+    "--config", 'model_providers.openrouter.name="OpenRouter"',
+    "--config", "model_providers.openrouter.base_url=" + {base_url_json},
+    "--config", 'model_providers.openrouter.env_key="OPENAI_API_KEY"',
+    "--config", 'model_providers.openrouter.wire_api="responses"',
+    "--config", "model_providers.openrouter.supports_websockets=false",
     "--model", {model_json},
     prompt,
 ]
@@ -336,6 +337,11 @@ def web_console() -> HTMLResponse:
     return HTMLResponse(CONSOLE_HTML)
 
 
+@app.get("/api/favicon.ico")
+def favicon() -> Response:
+    return Response(status_code=204)
+
+
 CONSOLE_HTML = """<!doctype html>
 <html lang="en">
 <head>
@@ -381,7 +387,7 @@ CONSOLE_HTML = """<!doctype html>
       return data;
     }
     function renderStatus(data) {
-      const rows = [["Configured", data.configured ? "yes" : "no"], ["Sandbox", data.sandbox_created ? "created" : "not created"], ["Git + Codex", data.bootstrap_complete ? "ready" : "not installed"], ["Model", data.model], ["Router", data.token_router_base_url], ["ID", data.sandbox_id || "—"]];
+      const rows = [["Configured", data.configured ? "yes" : "no"], ["Sandbox", data.sandbox_created ? "created" : "not created"], ["Git + Codex", data.bootstrap_complete ? "ready" : "not installed"], ["Provider", data.provider || "openrouter"], ["Model", data.model], ["Gateway", data.provider_base_url], ["ID", data.sandbox_id || "—"]];
       $("status").innerHTML = rows.map(([key,value]) => `<div class="status-item"><span>${key}</span><span class="value ${value === "no" ? "off" : ""}">${value}</span></div>`).join("");
       $("connection-badge").textContent = data.sandbox_created ? "Sandbox online" : (data.configured ? "Ready to connect" : "Secrets missing");
     }

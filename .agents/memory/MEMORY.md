@@ -1,0 +1,1 @@
+- [Codex gateway compatibility](codex-gateway-compatibility.md) — current Codex CLI uses custom Responses providers; disable WebSockets for HTTP-only gateways.

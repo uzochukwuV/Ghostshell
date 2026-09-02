@@ -25,5 +25,6 @@ channel = "stable-25_05"
 [userenv]
 
 [userenv.shared]
-CODEX_MODEL = "z-ai/glm-5.3-free"
+CODEX_MODEL = "z-ai/glm-5.2:free"
 TOKEN_ROUTER_BASE_URL = "https://api.tokenrouter.com/v1"
+CODEX_BASE_URL = "https://openrouter.ai/api/v1/"
