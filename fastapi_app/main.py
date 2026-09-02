@@ -175,15 +175,16 @@ results.append(run(["codex", "--version"]))
 config_dir = os.path.expanduser("~/.codex")
 os.makedirs(config_dir, exist_ok=True)
 with open(os.path.join(config_dir, "config.toml"), "w", encoding="utf-8") as config_file:
-    config_file.write("model = __MODEL_TOML__\n")
+    config_file.write('model = __MODEL_TOML__\n')
     config_file.write('model_provider = "tokenrouter"\n')
     config_file.write('approval_policy = "never"\n')
     config_file.write('sandbox_mode = "workspace-write"\n')
     config_file.write("\n[model_providers.tokenrouter]\n")
     config_file.write('name = "Token Router"\n')
-    config_file.write("base_url = __BASE_URL_TOML__\n")
+    config_file.write('base_url = __BASE_URL_TOML__\n')
     config_file.write('env_key = "OPENAI_API_KEY"\n')
     config_file.write('wire_api = "responses"\n')
+    config_file.write("supports_websockets = false\n")
 
 print(json.dumps({"steps": results, "codex_home": config_dir}))
 """.replace("__MODEL_TOML__", model_toml).replace(
@@ -231,11 +232,12 @@ command = [
     "codex", "exec",
     "--skip-git-repo-check",
     "--sandbox", "workspace-write",
-    "--config", "model_provider=\"tokenrouter\"",
-    "--config", "model_providers.tokenrouter.name=\"Token Router\"",
-    "--config", f"model_providers.tokenrouter.base_url={base_url_json}",
-    "--config", "model_providers.tokenrouter.env_key=\"OPENAI_API_KEY\"",
-    "--config", "model_providers.tokenrouter.wire_api=\"responses\"",
+    "--config", 'model_provider="tokenrouter"',
+    "--config", 'model_providers.tokenrouter.name="Token Router"',
+    "--config", "model_providers.tokenrouter.base_url=" + {base_url_json},
+    "--config", 'model_providers.tokenrouter.env_key="OPENAI_API_KEY"',
+    "--config", 'model_providers.tokenrouter.wire_api="responses"',
+    "--config", "model_providers.tokenrouter.supports_websockets=false",
     "--model", {model_json},
     prompt,
 ]
