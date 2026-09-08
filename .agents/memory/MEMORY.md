@@ -1,1 +1,2 @@
 - [Codex gateway compatibility](codex-gateway-compatibility.md) — current Codex CLI uses custom Responses providers; disable WebSockets for HTTP-only gateways.
+- [API artifact preview routing](api-artifact-preview-routing.md) — API artifacts are previewed under /api; browser assets must use the scoped route.

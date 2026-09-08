@@ -1,7 +1,7 @@
 # Daytona Codex Sandbox
 
-This project provides a FastAPI control plane and a small browser console for
-running Codex headlessly inside an isolated Daytona sandbox.
+This project provides a FastAPI control plane and a cloud-coder browser workspace
+for running Codex headlessly inside an isolated Daytona sandbox.
 
 ## Configuration
 
@@ -28,6 +28,14 @@ Open the `/api/` preview route to use the browser console. The JSON API is:
 - `POST /api/sandbox/code` with `{"code":"print('hello')"}`
 - `POST /api/sandbox/prompt` with `{"prompt":"...","timeout_seconds":600}`
 - `GET /api/sandbox/logs` — recent run logs
+- `POST /api/workspace/repository` with `{"repo_url":"https://github.com/org/repo","branch":"main"}`
+- `GET /api/workspace/tree` — files in the cloned repository
+- `GET /api/workspace/file?path=README.md` — read a workspace file
+- `PUT /api/workspace/file` with `{"path":"README.md","content":"..."}` — save a workspace file
+
+The workspace accepts public HTTPS Git repositories. Repository credentials are
+not accepted in URLs, and private repository authentication is not implemented.
+Codex prompts are scoped to the cloned repository when one is configured.
 
 The service is intentionally a single-sandbox development MVP. Add
 authentication, per-user sandbox ownership, quotas, and durable job storage
