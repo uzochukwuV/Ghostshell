@@ -59,6 +59,7 @@ class DaytonaSandboxManager:
         self.sandbox_id: str | None = None
         self.bootstrap_complete = False
         self.repository: dict[str, Any] | None = None
+        self.ide: dict[str, Any] | None = None
         self.logs: list[RunLog] = []
 
     def _settings(self) -> dict[str, str]:
@@ -85,6 +86,11 @@ class DaytonaSandboxManager:
             "model": os.getenv("CODEX_MODEL", DEFAULT_CODEX_MODEL),
             "provider_base_url": os.getenv("CODEX_BASE_URL", DEFAULT_OPENROUTER_URL),
             "repository": self.repository,
+            "ide": (
+                {key: value for key, value in self.ide.items() if key != "url"}
+                if self.ide
+                else None
+            ),
         }
 
     @staticmethod
@@ -252,6 +258,150 @@ raise SystemExit(0 if all(code == 0 for code in critical_exit_codes) else 1)
     def run_code(self, code: str) -> dict[str, Any]:
         with self._lock:
             return self._code_run(code, "code")
+
+    def start_ide(self) -> dict[str, Any]:
+        with self._lock:
+            if self.sandbox is None:
+                self.create()
+            assert self.sandbox is not None
+
+            home_json = json.dumps(self.sandbox.get_user_home_dir())
+            folder_json = json.dumps(
+                self.repository["path"] if self.repository else self.sandbox.get_user_home_dir()
+            )
+            ide_code = f"""
+import json
+import os
+import shutil
+import signal
+import subprocess
+import time
+import urllib.request
+
+home = {home_json}
+default_folder = {folder_json}
+install_root = os.path.join(home, ".openvscode-server")
+binary = os.path.join(install_root, "bin", "openvscode-server")
+pid_file = os.path.join(home, ".openvscode-server.pid")
+log_file = os.path.join(home, ".openvscode-server.log")
+
+def running_pid():
+    try:
+        with open(pid_file, "r", encoding="utf-8") as file:
+            pid = int(file.read().strip())
+        os.kill(pid, 0)
+        return pid
+    except (OSError, ValueError, FileNotFoundError):
+        return None
+
+if not os.path.exists(binary):
+    if not shutil.which("curl") or not shutil.which("tar"):
+        installer = subprocess.run(
+            ["sh", "-lc", "apt-get update -y && apt-get install -y curl ca-certificates tar"],
+            capture_output=True, text=True, timeout=900, check=False,
+        )
+        if installer.returncode:
+            print(json.dumps({{"error": installer.stderr[-4000:]}}))
+            raise SystemExit(installer.returncode)
+    metadata = urllib.request.urlopen(
+        "https://api.github.com/repos/gitpod-io/openvscode-server/releases/latest",
+        timeout=30,
+    ).read()
+    release = json.loads(metadata)
+    assets = [
+        asset["browser_download_url"]
+        for asset in release.get("assets", [])
+        if asset.get("name", "").endswith("linux-x64.tar.gz")
+    ]
+    if not assets:
+        print(json.dumps({{"error": "No Linux x64 openvscode-server release was found."}}))
+        raise SystemExit(1)
+    archive = os.path.join(home, ".openvscode-server.tar.gz")
+    completed = subprocess.run(
+        ["curl", "-fsSL", assets[0], "-o", archive],
+        capture_output=True, text=True, timeout=900, check=False,
+    )
+    if completed.returncode:
+        print(json.dumps({{"error": completed.stderr[-4000:]}}))
+        raise SystemExit(completed.returncode)
+    extract_root = os.path.join(home, ".openvscode-extract")
+    shutil.rmtree(extract_root, ignore_errors=True)
+    os.makedirs(extract_root, exist_ok=True)
+    completed = subprocess.run(
+        ["tar", "-xzf", archive, "-C", extract_root],
+        capture_output=True, text=True, timeout=300, check=False,
+    )
+    if completed.returncode:
+        print(json.dumps({{"error": completed.stderr[-4000:]}}))
+        raise SystemExit(completed.returncode)
+    extracted = [
+        os.path.join(extract_root, item)
+        for item in os.listdir(extract_root)
+        if os.path.isdir(os.path.join(extract_root, item))
+    ]
+    if not extracted:
+        print(json.dumps({{"error": "openvscode-server archive was empty."}}))
+        raise SystemExit(1)
+    shutil.rmtree(install_root, ignore_errors=True)
+    shutil.move(extracted[0], install_root)
+    shutil.rmtree(extract_root, ignore_errors=True)
+    os.remove(archive)
+
+pid = running_pid()
+if not pid:
+    os.makedirs(os.path.dirname(log_file), exist_ok=True)
+    log = open(log_file, "a", encoding="utf-8")
+    process = subprocess.Popen(
+        [
+            binary,
+            "--host", "0.0.0.0",
+            "--port", "2280",
+            "--without-connection-token",
+            "--default-folder", default_folder,
+        ],
+        stdout=log,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+        env=os.environ.copy(),
+    )
+    with open(pid_file, "w", encoding="utf-8") as file:
+        file.write(str(process.pid))
+    time.sleep(2)
+    if process.poll() is not None:
+        print(json.dumps({{"error": "openvscode-server exited during startup."}}))
+        raise SystemExit(1)
+    pid = process.pid
+
+print(json.dumps({{
+    "installed": os.path.exists(binary),
+    "running": bool(pid),
+    "pid": pid,
+    "port": 2280,
+    "folder": default_folder,
+}}))
+"""
+            result = self._code_run(ide_code, "ide-start")
+            if result["exit_code"] != 0:
+                raise RuntimeError(result["result"] or "VS Code server failed to start.")
+            try:
+                details = json.loads(result["result"].splitlines()[-1])
+            except (ValueError, IndexError) as exc:
+                raise RuntimeError("VS Code server returned an invalid result.") from exc
+            if "error" in details:
+                raise RuntimeError(details["error"])
+            preview = self.sandbox.create_signed_preview_url(
+                2280, expires_in_seconds=3600
+            )
+            preview_url = str(getattr(preview, "url", preview))
+            self.ide = {
+                "provider": "openvscode-server",
+                "port": 2280,
+                "running": True,
+                "url": preview_url,
+                "expires_in_seconds": 3600,
+                "folder": details.get("folder"),
+            }
+            return {"status": self.status(), "ide": self.ide, "run": result}
 
     def prompt(self, prompt: str, timeout_seconds: int) -> dict[str, Any]:
         with self._lock:
@@ -562,6 +712,15 @@ def run_code(request: CodeRunRequest) -> dict[str, Any]:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
+@app.post("/api/sandbox/ide")
+def start_sandbox_ide() -> dict[str, Any]:
+    try:
+        return manager.start_ide()
+    except Exception as exc:
+        logger.exception("VS Code server failed to start")
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
 @app.post("/api/sandbox/prompt")
 def prompt_codex(request: PromptRequest) -> dict[str, Any]:
     try:
@@ -657,6 +816,8 @@ CONSOLE_HTML = """<!doctype html>
     .editor { min-width:0; display:flex; flex-direction:column; background:#0f1216; } .editor-head { border-bottom:1px solid var(--line); min-height:45px; display:flex; align-items:center; gap:8px; padding:0 13px; overflow:auto; } .tabs { display:flex; align-self:stretch; gap:2px; } .tab { display:flex; align-items:center; gap:7px; padding:0 12px; color:var(--muted); border-bottom:2px solid transparent; white-space:nowrap; cursor:pointer; font-size:12px; } .tab.active { color:var(--text); border-color:var(--accent); background:#14181d; } .editor-title { color:var(--muted); font-size:12px; margin-left:auto; white-space:nowrap; } .editor-body { flex:1; min-height:0; display:flex; flex-direction:column; } #editor { flex:1; min-height:0; resize:none; border:0; border-radius:0; padding:22px; background:#0f1216; font:13px/1.65 ui-monospace,SFMono-Regular,Menlo,monospace; tab-size:2; } .editor-footer { min-height:47px; border-top:1px solid var(--line); display:flex; align-items:center; justify-content:space-between; padding:0 14px; color:var(--muted); font-size:11px; } .editor-footer strong { color:var(--accent); font-weight:500; }
     .chat-head { border-bottom:1px solid var(--line); padding:16px; } .chat-head h2 { margin:0 0 3px; font-size:15px; } .chat-head p { color:var(--muted); margin:0; font-size:12px; } .messages { flex:1; overflow:auto; padding:16px; display:flex; flex-direction:column; gap:12px; } .message { border:1px solid var(--line); border-radius:11px; padding:11px 12px; background:var(--panel2); font-size:13px; white-space:pre-wrap; word-break:break-word; } .message.user { background:#202b35; border-color:#334658; } .message .who { color:var(--muted); text-transform:uppercase; font-size:10px; letter-spacing:.1em; margin-bottom:5px; } .message pre { white-space:pre-wrap; color:#cdd3cb; font:11px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; margin:10px 0 0; border-top:1px solid var(--line); padding-top:9px; max-height:260px; overflow:auto; } .chat-compose { padding:12px; border-top:1px solid var(--line); } #prompt { min-height:78px; resize:vertical; } .compose-row { display:flex; align-items:center; justify-content:space-between; gap:8px; margin-top:8px; } .compose-row input { width:90px; } .empty { color:var(--muted); font-size:12px; text-align:center; padding:30px 10px; }
     .status-list { display:grid; gap:6px; margin-top:10px; } .status-item { display:flex; justify-content:space-between; gap:8px; font-size:11px; color:var(--muted); } .status-item span:last-child { color:var(--text); text-align:right; max-width:150px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; } .error { color:var(--danger); font-size:12px; margin:8px 0; }
+     .view-switch { display:flex; gap:4px; margin-right:7px; } .view-switch button { padding:5px 9px; font-size:11px; } .view-switch button.active { background:var(--panel2); border-color:var(--accent); color:var(--accent); } .view-switch button:disabled { cursor:not-allowed; }
+     .ide-body { flex:1; min-height:0; position:relative; background:#0b0d10; } .ide-body[hidden], .ide-body iframe[hidden] { display:none; } .ide-body iframe { width:100%; height:100%; min-height:600px; border:0; display:block; } .ide-empty { display:grid; place-items:center; height:100%; min-height:600px; color:var(--muted); padding:30px; text-align:center; } .ide-empty strong { display:block; color:var(--text); margin-bottom:6px; }
     @media (max-width:1050px) { .workspace { grid-template-columns:230px minmax(320px,1fr); } .chat { grid-column:1/-1; height:360px; border-left:0; border-top:1px solid var(--line); } body { overflow:auto; } .workspace { height:auto; min-height:calc(100vh - 62px); } .editor { min-height:600px; } } @media (max-width:650px) { header { padding:0 12px; } .brand small { display:none; } .workspace { display:block; } .sidebar,.chat,.editor { border:0; border-bottom:1px solid var(--line); } .sidebar { max-height:none; } .editor { min-height:560px; } }
   </style>
 </head>
@@ -682,12 +843,14 @@ CONSOLE_HTML = """<!doctype html>
       <div class="section">
         <div class="section-title"><span>Sandbox</span></div>
         <div class="inline"><button id="create">Create</button><button id="bootstrap">Install toolchain</button></div>
+        <button id="start-ide" style="width:100%;margin-top:8px">Open VS Code</button>
         <div class="status-list" id="status"></div>
       </div>
     </aside>
     <main class="editor">
-      <div class="editor-head"><div class="tabs" id="tabs"><div class="empty" style="padding:12px">Open a file from the explorer.</div></div><div class="editor-title" id="editor-title">No file selected</div></div>
-      <div class="editor-body"><textarea id="editor" spellcheck="false" placeholder="Select a file to view and edit it."></textarea></div>
+      <div class="editor-head"><div class="view-switch"><button id="view-code" class="active">Code</button><button id="view-ide" disabled>VS Code</button></div><div class="tabs" id="tabs"><div class="empty" style="padding:12px">Open a file from the explorer.</div></div><div class="editor-title" id="editor-title">No file selected</div></div>
+      <div class="editor-body" id="code-view"><textarea id="editor" spellcheck="false" placeholder="Select a file to view and edit it."></textarea></div>
+      <div class="ide-body" id="ide-view" hidden><div class="ide-empty" id="ide-empty"><div><strong>VS Code is not running</strong>Launch it from the Sandbox controls to open the full browser IDE.</div></div><iframe id="ide-frame" title="VS Code in Daytona" allow="clipboard-read; clipboard-write" hidden></iframe></div>
       <div class="editor-footer"><span id="file-meta">No file open</span><button class="primary" id="save" disabled>Save file</button></div>
     </main>
     <section class="chat">
@@ -699,7 +862,7 @@ CONSOLE_HTML = """<!doctype html>
   <script>
     const base = location.pathname.startsWith("/api") ? "/api" : "";
     const $ = (id) => document.getElementById(id);
-    const state = { status:null, entries:[], open:[], active:null, contents:{} };
+    const state = { status:null, entries:[], open:[], active:null, contents:{}, ideUrl:null };
     const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#039;" }[char]));
     async function call(path, options = {}) {
       const response = await fetch(base + path, { headers: {"Content-Type":"application/json"}, ...options });
@@ -715,7 +878,26 @@ CONSOLE_HTML = """<!doctype html>
       $("connection-badge").className = "pill" + (data.sandbox_created ? " online" : "");
       const rows = [["Sandbox", data.sandbox_created ? "created" : "not created"], ["Toolchain", data.bootstrap_complete ? "ready" : "not installed"], ["Provider", data.provider || "openrouter"], ["Model", data.model || "—"], ["Repository", repo ? (repo.branch || "default") : "—"]];
       $("status").innerHTML = rows.map(([key,value]) => `<div class="status-item"><span>${escapeHtml(key)}</span><span title="${escapeHtml(value)}">${escapeHtml(value)}</span></div>`).join("");
+      applyIde(data.ide);
       if (repo && !$("repo-url").value) { $("repo-url").value = repo.url || ""; $("branch").value = repo.branch || ""; }
+    }
+    function setView(view) {
+      const ide = view === "ide";
+      $("code-view").hidden = ide;
+      $("ide-view").hidden = !ide;
+      $("view-code").classList.toggle("active", !ide);
+      $("view-ide").classList.toggle("active", ide);
+    }
+    function applyIde(ide) {
+      const available = Boolean(ide && ide.running && ide.url);
+      $("view-ide").disabled = !available;
+      $("start-ide").textContent = available ? "Open VS Code" : "Launch VS Code";
+      if (available && ide.url !== state.ideUrl) {
+        state.ideUrl = ide.url;
+        $("ide-frame").src = ide.url;
+        $("ide-frame").hidden = false;
+        $("ide-empty").hidden = true;
+      }
     }
     function renderTree() {
       if (!state.entries.length) { $("tree").innerHTML = '<div class="tree-empty">No files found.</div>'; return; }
@@ -746,10 +928,13 @@ CONSOLE_HTML = """<!doctype html>
     async function refresh() {
       try { const data = await call("/sandbox"); renderStatus(data); if (data.repository) { const tree = await call("/workspace/tree"); state.entries = tree.entries; renderTree(); } } catch (error) { addMessage("system", error.message); }
     }
-    async function busy(button, task) { button.disabled = true; try { const data = await task(); renderStatus(data.status || data); await refresh(); return data; } catch (error) { addMessage("system", error.message); } finally { button.disabled = false; } }
+    async function busy(button, task) { button.disabled = true; try { const data = await task(); renderStatus(data.status || data); await refresh(); if (data.ide) applyIde(data.ide); return data; } catch (error) { addMessage("system", error.message); } finally { button.disabled = false; } }
     $("clone").onclick = () => busy($("clone"), async () => { const data = await call("/workspace/repository", {method:"POST", body:JSON.stringify({repo_url:$("repo-url").value, branch:$("branch").value || null, replace_existing:$("replace-repo").checked})}); state.entries = (await call("/workspace/tree")).entries; renderTree(); addMessage("system", "Repository cloned into the Daytona sandbox.", data.run && data.run.result); return data; });
     $("create").onclick = () => busy($("create"), () => call("/sandbox", {method:"POST", body:"{}"}));
     $("bootstrap").onclick = () => busy($("bootstrap"), () => call("/sandbox/bootstrap", {method:"POST", body:"{}"}));
+    $("start-ide").onclick = () => busy($("start-ide"), async () => { const data = await call("/sandbox/ide", {method:"POST", body:"{}"}); applyIde(data.ide); setView("ide"); addMessage("system", "Open VS Code is running in the Daytona sandbox."); return data; });
+    $("view-code").onclick = () => setView("code");
+    $("view-ide").onclick = () => { if (!$("view-ide").disabled) setView("ide"); };
     $("refresh").onclick = refresh; $("reload-tree").onclick = async () => { try { state.entries = (await call("/workspace/tree")).entries; renderTree(); } catch (error) { addMessage("system", error.message); } };
     $("editor").oninput = () => { $("file-meta").textContent = `${state.active || "No file"} · ${new Blob([$("editor").value]).size} bytes · unsaved`; };
     $("save").onclick = () => busy($("save"), async () => { const data = await call("/workspace/file", {method:"PUT", body:JSON.stringify({path:state.active, content:$("editor").value})}); state.contents[state.active] = $("editor").value; addMessage("system", `Saved ${state.active}.`, data.run && data.run.result); return {status:state.status}; });

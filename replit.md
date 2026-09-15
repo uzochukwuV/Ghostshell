@@ -1,6 +1,8 @@
 # Daytona Codex Sandbox
 
-FastAPI control plane for creating Daytona sandboxes, bootstrapping Git and Codex, and sending headless coding prompts through an OpenAI-compatible gateway.
+FastAPI control plane for creating Daytona sandboxes, bootstrapping Git/Codex,
+launching openvscode-server, and sending headless coding prompts through an
+OpenAI-compatible gateway.
 
 ## Run & Operate
 
@@ -38,9 +40,12 @@ FastAPI control plane for creating Daytona sandboxes, bootstrapping Git and Code
 - Open `/api/` for the browser console.
 - `POST /api/sandbox` creates the isolated Daytona runtime.
 - `POST /api/sandbox/bootstrap` installs/checks Git and Codex.
+- `POST /api/sandbox/ide` installs and starts openvscode-server on port 2280.
 - `POST /api/sandbox/code` runs bounded Python snippets using Daytona's secure code runner.
 - `POST /api/sandbox/prompt` sends a headless Codex task and returns its logs and exit code.
 - `GET /api/sandbox/logs` returns recent sanitized run logs.
+- The `/api/` console embeds the Daytona IDE beside the lightweight file editor
+  and Codex chat.
 
 ## User preferences
 
@@ -50,6 +55,8 @@ FastAPI control plane for creating Daytona sandboxes, bootstrapping Git and Code
 
 - The current Codex CLI requires custom providers to use the Responses wire API; gateways must support `/v1/responses`.
 - A 429 from OpenRouter is surfaced as a failed Codex run instead of being retried by the FastAPI service.
+- The IDE is intentionally launched lazily; installing openvscode-server downloads
+  the latest Linux x64 release into the sandbox home directory.
 
 ## Pointers
 
