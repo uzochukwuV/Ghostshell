@@ -45,6 +45,11 @@ venv/
 .pytest_cache/
 .ruff_cache/
 
+# Secrets
+.env
+.env.*
+!.env.example
+
 # System Files
 .DS_Store
 Thumbs.db
@@ -55,3 +60,6 @@ Thumbs.db
 # Replit
 .cache/
 .local/
+
+# Sandbox id persisted across restarts
+.sandbox-state

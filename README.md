@@ -25,7 +25,7 @@ Open the `/api/` preview route to use the browser console. The JSON API is:
 - `GET /api/healthz` — configuration and runtime status
 - `POST /api/sandbox` — create a Daytona sandbox
 - `POST /api/sandbox/bootstrap` — check/install Git and Codex
-- `POST /api/sandbox/ide` — install and start openvscode-server on Daytona port 2280
+- `POST /api/sandbox/ide` — install and start openvscode-server, auto-selecting a free port
 - `POST /api/sandbox/code` with `{"code":"print('hello')"}`
 - `POST /api/sandbox/prompt` with `{"prompt":"...","timeout_seconds":600}`
 - `GET /api/sandbox/logs` — recent run logs
@@ -37,8 +37,11 @@ Open the `/api/` preview route to use the browser console. The JSON API is:
 The workspace accepts public HTTPS Git repositories. Repository credentials are
 not accepted in URLs, and private repository authentication is not implemented.
 Codex prompts are scoped to the cloned repository when one is configured.
-The VS Code tab uses Daytona's private preview link for the sandbox IDE and
-opens the repository as its default folder.
+The VS Code tab embeds a signed Daytona preview URL, which authenticates the
+iframe without requiring a request header the browser cannot set. The sandbox
+agent already holds port 2280, so the IDE picks the first free port from 2280
+upward and reports the URL for that port. Preview links expire after an hour;
+launching VS Code again issues a fresh one.
 
 The service is intentionally a single-sandbox development MVP. Add
 authentication, per-user sandbox ownership, quotas, and durable job storage
