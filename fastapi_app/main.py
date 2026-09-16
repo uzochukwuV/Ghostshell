@@ -20,6 +20,8 @@ logger = logging.getLogger("daytona-codex")
 
 DEFAULT_OPENROUTER_URL = "https://openrouter.ai/api/v1/"
 DEFAULT_CODEX_MODEL = "z-ai/glm-5.2:free"
+DEFAULT_CODEX_PROVIDER = "openrouter"
+PROVIDER_ID_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,63}")
 
 # Codex runs its own bubblewrap sandbox by default, which cannot start inside
 # Daytona (it needs CAP_NET_ADMIN to configure the loopback device). Permission
@@ -131,24 +133,37 @@ class DaytonaSandboxManager:
         api_key = os.getenv("DAYTONA_API_KEY")
         if not api_key:
             raise RuntimeError("DAYTONA_API_KEY is not configured")
+        provider = os.getenv("CODEX_PROVIDER", DEFAULT_CODEX_PROVIDER).strip().lower()
+        if not PROVIDER_ID_PATTERN.fullmatch(provider):
+            raise RuntimeError("CODEX_PROVIDER must be a simple provider identifier")
+        provider_key = (
+            os.getenv("CODEX_API_KEY")
+            or os.getenv("OPENROUTER_KEY")
+            or os.getenv("TOKEN_ROUTER_API_KEY", "")
+        )
+        if not provider_key:
+            raise RuntimeError("CODEX_API_KEY is not configured")
         return {
+            "provider": provider,
+            "provider_name": os.getenv("CODEX_PROVIDER_NAME", provider).strip() or provider,
             "provider_url": os.getenv("CODEX_BASE_URL", DEFAULT_OPENROUTER_URL),
             "model": os.getenv("CODEX_MODEL", DEFAULT_CODEX_MODEL),
             "codex_sandbox": os.getenv("CODEX_SANDBOX", DEFAULT_CODEX_SANDBOX),
-            "provider_key": os.getenv("OPENROUTER_KEY")
-            or os.getenv("TOKEN_ROUTER_API_KEY", ""),
+            "provider_key": provider_key,
         }
 
     def status(self) -> dict[str, Any]:
+        provider_key = (
+            os.getenv("CODEX_API_KEY")
+            or os.getenv("OPENROUTER_KEY")
+            or os.getenv("TOKEN_ROUTER_API_KEY")
+        )
         return {
-            "configured": bool(
-                os.getenv("DAYTONA_API_KEY")
-                and (os.getenv("OPENROUTER_KEY") or os.getenv("TOKEN_ROUTER_API_KEY"))
-            ),
+            "configured": bool(os.getenv("DAYTONA_API_KEY") and provider_key),
             "sandbox_created": self.sandbox is not None,
             "sandbox_id": self.sandbox_id,
             "bootstrap_complete": self.bootstrap_complete,
-            "provider": "openrouter",
+            "provider": os.getenv("CODEX_PROVIDER", DEFAULT_CODEX_PROVIDER),
             "model": os.getenv("CODEX_MODEL", DEFAULT_CODEX_MODEL),
             "provider_base_url": os.getenv("CODEX_BASE_URL", DEFAULT_OPENROUTER_URL),
             "repository": self.repository,
@@ -324,6 +339,8 @@ class DaytonaSandboxManager:
 
             settings = self._settings()
             model_toml = json.dumps(settings["model"])
+            provider_toml = json.dumps(settings["provider"])
+            provider_name_toml = json.dumps(settings["provider_name"])
             base_url_toml = json.dumps(settings["provider_url"])
             bootstrap_code = r"""
 import json
@@ -369,11 +386,11 @@ config_dir = os.path.expanduser("~/.codex")
 os.makedirs(config_dir, exist_ok=True)
 with open(os.path.join(config_dir, "config.toml"), "w", encoding="utf-8") as config_file:
     config_file.write('model = __MODEL_TOML__\n')
-    config_file.write('model_provider = "openrouter"\n')
+    config_file.write('model_provider = ' + __PROVIDER_TOML__ + '\n')
     config_file.write('approval_policy = "never"\n')
     config_file.write('sandbox_mode = "workspace-write"\n')
-    config_file.write("\n[model_providers.openrouter]\n")
-    config_file.write('name = "OpenRouter"\n')
+    config_file.write("\n[model_providers." + __PROVIDER_TOML__ + "]\n")
+    config_file.write('name = ' + __PROVIDER_NAME_TOML__ + '\n')
     config_file.write('base_url = __BASE_URL_TOML__\n')
     config_file.write('env_key = "OPENAI_API_KEY"\n')
     config_file.write('wire_api = "responses"\n')
@@ -383,6 +400,8 @@ print(json.dumps({"steps": results, "codex_home": config_dir}))
 critical_exit_codes = [results[-2]["exit_code"], results[-1]["exit_code"]]
 raise SystemExit(0 if all(code == 0 for code in critical_exit_codes) else 1)
 """.replace("__MODEL_TOML__", model_toml).replace(
+                "__PROVIDER_TOML__", provider_toml
+            ).replace("__PROVIDER_NAME_TOML__", provider_name_toml).replace(
                 "__BASE_URL_TOML__", base_url_toml
             )
             result = self._code_run(bootstrap_code, "bootstrap")
@@ -888,6 +907,8 @@ print(json.dumps({
         base_url_json = json.dumps(settings["provider_url"])
         key_json = json.dumps(settings["provider_key"])
         model_json = json.dumps(settings["model"])
+        provider_json = json.dumps(settings["provider"])
+        provider_name_json = json.dumps(settings["provider_name"])
         codex_sandbox_json = json.dumps(settings["codex_sandbox"])
         repo_path_json = json.dumps(
             self.repository["path"] if self.repository else ""
@@ -906,12 +927,12 @@ command = [
     "codex", "exec",
     "--skip-git-repo-check",
     "--sandbox", {codex_sandbox_json},
-    "--config", 'model_provider="openrouter"',
-    "--config", 'model_providers.openrouter.name="OpenRouter"',
-    "--config", "model_providers.openrouter.base_url=" + {base_url_json},
-    "--config", 'model_providers.openrouter.env_key="OPENAI_API_KEY"',
-    "--config", 'model_providers.openrouter.wire_api="responses"',
-    "--config", "model_providers.openrouter.supports_websockets=false",
+    "--config", "model_provider=" + {provider_json},
+    "--config", "model_providers." + {provider_json} + ".name=" + {provider_name_json},
+    "--config", "model_providers." + {provider_json} + ".base_url=" + {base_url_json},
+    "--config", "model_providers." + {provider_json} + '.env_key="OPENAI_API_KEY"',
+    "--config", "model_providers." + {provider_json} + '.wire_api="responses"',
+    "--config", "model_providers." + {provider_json} + ".supports_websockets=false",
     "--model", {model_json},
 ]
 if working_directory:
@@ -1402,7 +1423,7 @@ CONSOLE_HTML = """<!doctype html>
       $("repo-state").textContent = repo ? "Connected" : "Not connected";
       $("connection-badge").textContent = data.sandbox_created ? "Sandbox online" : (data.configured ? "Ready to connect" : "Secrets missing");
       $("connection-badge").className = "pill" + (data.sandbox_created ? " online" : "");
-      const rows = [["Sandbox", data.sandbox_created ? "created" : "not created"], ["Toolchain", data.bootstrap_complete ? "ready" : "not installed"], ["Provider", data.provider || "openrouter"], ["Model", data.model || "—"], ["Repository", repo ? (repo.branch || "default") : "—"]];
+      const rows = [["Sandbox", data.sandbox_created ? "created" : "not created"], ["Toolchain", data.bootstrap_complete ? "ready" : "not installed"], ["Provider", data.provider || "configured provider"], ["Model", data.model || "—"], ["Repository", repo ? (repo.branch || "default") : "—"]];
       $("status").innerHTML = rows.map(([key,value]) => `<div class="status-item"><span>${escapeHtml(key)}</span><span title="${escapeHtml(value)}">${escapeHtml(value)}</span></div>`).join("");
       applyIde(data.ide);
       if (repo && !$("repo-url").value) { $("repo-url").value = repo.url || ""; $("branch").value = repo.branch || ""; }

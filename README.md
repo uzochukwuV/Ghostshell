@@ -5,18 +5,26 @@ for running Codex headlessly inside an isolated Daytona sandbox.
 
 ## Configuration
 
-Store these values as Replit Secrets:
+Copy `.env.example` into your deployment's secret store; never commit populated
+secret files. `DAYTONA_API_KEY` is required for the coding sandbox. Model
+providers use the generic OpenAI-compatible variables below:
 
-- `DAYTONA_API_KEY`
-- `OPENROUTER_KEY`
+- `CODEX_API_KEY` — preferred provider key; it takes precedence over legacy keys.
+- `CODEX_PROVIDER` — config identifier such as `nebius` or `openrouter`.
+- `CODEX_PROVIDER_NAME` — display/provider name written to Codex config.
+- `CODEX_BASE_URL` — provider endpoint URL.
+- `CODEX_MODEL` — model ID that you have verified supports Codex tool use.
 
-The defaults are already configured for:
+OpenRouter remains the default for compatibility (`OPENROUTER_KEY` and
+`TOKEN_ROUTER_API_KEY` are accepted fallbacks). To use a Nebius Serverless
+Endpoint, set `CODEX_PROVIDER=nebius`, set `CODEX_API_KEY`, and copy the
+OpenAI-compatible endpoint URL and supported model ID from the Nebius console.
+The API status deliberately reports configuration state rather than any key.
 
-- Gateway: `https://openrouter.ai/api/v1/`
-- Model: `z-ai/glm-5.2:free`
-
-You can override the gateway with `CODEX_BASE_URL` and the model with
-`CODEX_MODEL`.
+See [the Nebius cloud-coding architecture](docs/NEBIUS_CLOUD_CODING.md) for the
+recommended split between the long-running API, isolated coding executor,
+Serverless Endpoints, Serverless Jobs, secrets, custom domains, and Git App
+workflow.
 
 ## Use
 
