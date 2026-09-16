@@ -40,7 +40,7 @@ OpenAI-compatible gateway.
 - Open `/api/` for the browser console.
 - `POST /api/sandbox` creates the isolated Daytona runtime.
 - `POST /api/sandbox/bootstrap` installs/checks Git and Codex.
-- `POST /api/sandbox/ide` installs and starts openvscode-server on port 2280.
+- `POST /api/sandbox/ide` installs and starts openvscode-server on the first free port.
 - `POST /api/sandbox/code` runs bounded Python snippets using Daytona's secure code runner.
 - `POST /api/sandbox/prompt` sends a headless Codex task and returns its logs and exit code.
 - `GET /api/sandbox/logs` returns recent sanitized run logs.
@@ -57,6 +57,11 @@ OpenAI-compatible gateway.
 - A 429 from OpenRouter is surfaced as a failed Codex run instead of being retried by the FastAPI service.
 - The IDE is intentionally launched lazily; installing openvscode-server downloads
   the latest Linux x64 release into the sandbox home directory.
+- The Daytona agent process already listens on port 2280 inside the sandbox, so a
+  server started there fails to bind and the preview link returns the agent's 404.
+  The IDE scans from 2280 for the first port it can actually bind.
+- Preview links need the signed variant for iframes: the plain link requires an
+  `X-Daytona-Preview-Token` header browsers cannot set.
 
 ## Pointers
 

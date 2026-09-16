@@ -1,2 +1,5 @@
 - [Codex gateway compatibility](codex-gateway-compatibility.md) — current Codex CLI uses custom Responses providers; disable WebSockets for HTTP-only gateways.
 - [API artifact preview routing](api-artifact-preview-routing.md) — API artifacts are previewed under /api; browser assets must use the scoped route.
+- [Daytona preview links and reserved ports](daytona-preview-links.md) — port 2280 belongs to the sandbox agent; iframes need a signed preview URL.
+- [Docker inside a Daytona sandbox](daytona-docker.md) — works as root via internal sudo; dockerd must be started detached.
+- [Zeabur deployment](zeabur-deploy.md) — live at https://ghostshell.zeabur.app; ZeaburOS (k3s) had to be installed on the server first.

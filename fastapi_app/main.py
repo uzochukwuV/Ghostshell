@@ -5,9 +5,10 @@ import logging
 import os
 import posixpath
 import re
+import shlex
 import threading
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlparse
 
@@ -19,6 +20,23 @@ logger = logging.getLogger("daytona-codex")
 
 DEFAULT_OPENROUTER_URL = "https://openrouter.ai/api/v1/"
 DEFAULT_CODEX_MODEL = "z-ai/glm-5.2:free"
+
+# Codex runs its own bubblewrap sandbox by default, which cannot start inside
+# Daytona (it needs CAP_NET_ADMIN to configure the loopback device). Permission
+# checking stays on, but Daytona's own isolation is the sandbox of record.
+DEFAULT_CODEX_SANDBOX = "danger-full-access"
+
+# The Daytona agent process itself listens on IDE_PORT_DEFAULT inside the sandbox,
+# so the VS Code server probes forward from there for a port it can actually bind.
+IDE_PORT_DEFAULT = 2280
+IDE_PORT_SCAN_RANGE = 25
+IDE_READY_TIMEOUT_SECONDS = 120
+IDE_PREVIEW_TTL_SECONDS = 3600
+
+# Docker is opt-in: it needs root inside the sandbox, so it changes the trust
+# boundary of the runtime the browser console hands to Codex.
+DOCKER_ENABLED_VALUES = {"1", "true", "yes", "on"}
+CONTAINER_PREVIEW_TTL_SECONDS = 3600
 
 
 class PromptRequest(BaseModel):
@@ -41,6 +59,23 @@ class FileWriteRequest(BaseModel):
     content: str = Field(max_length=300_000)
 
 
+class ContainerRequest(BaseModel):
+    image: str = Field(min_length=1, max_length=300)
+    command: str | None = Field(default=None, max_length=2_000)
+    name: str = Field(default="app", min_length=1, max_length=63)
+    ports: list[int] = Field(default_factory=list, max_length=8)
+    env: dict[str, str] = Field(default_factory=dict)
+    volumes: dict[str, str] = Field(default_factory=dict)
+
+
+class ContainerStopRequest(BaseModel):
+    name: str = Field(default="app", min_length=1, max_length=63)
+
+
+class AttachRequest(BaseModel):
+    sandbox_id: str | None = Field(default=None, max_length=64)
+
+
 @dataclass
 class RunLog:
     kind: str
@@ -60,7 +95,37 @@ class DaytonaSandboxManager:
         self.bootstrap_complete = False
         self.repository: dict[str, Any] | None = None
         self.ide: dict[str, Any] | None = None
+        self._ide_preview: dict[str, Any] | None = None
+        self.docker: dict[str, Any] | None = None
+        self._container_previews: dict[str, dict[str, Any]] = {}
         self.logs: list[RunLog] = []
+        self._restore_sandbox_id()
+
+    def _state_file(self) -> str:
+        return os.getenv("SANDBOX_STATE_FILE", os.path.join(os.getcwd(), ".sandbox-state"))
+
+    def _restore_sandbox_id(self) -> None:
+        """Reloads the last sandbox id so a restart reattaches instead of leaking one."""
+        try:
+            with open(self._state_file(), encoding="utf-8") as handle:
+                sandbox_id = handle.read().strip()
+        except OSError:
+            return
+        if sandbox_id:
+            self.sandbox_id = sandbox_id
+
+    def _persist_sandbox_id(self) -> None:
+        if not self.sandbox_id:
+            return
+        try:
+            with open(self._state_file(), "w", encoding="utf-8") as handle:
+                handle.write(self.sandbox_id)
+        except OSError:
+            logger.warning("Could not persist the sandbox id to %s", self._state_file())
+
+    @staticmethod
+    def _docker_enabled() -> bool:
+        return os.getenv("ENABLE_DOCKER", "").strip().lower() in DOCKER_ENABLED_VALUES
 
     def _settings(self) -> dict[str, str]:
         api_key = os.getenv("DAYTONA_API_KEY")
@@ -69,6 +134,7 @@ class DaytonaSandboxManager:
         return {
             "provider_url": os.getenv("CODEX_BASE_URL", DEFAULT_OPENROUTER_URL),
             "model": os.getenv("CODEX_MODEL", DEFAULT_CODEX_MODEL),
+            "codex_sandbox": os.getenv("CODEX_SANDBOX", DEFAULT_CODEX_SANDBOX),
             "provider_key": os.getenv("OPENROUTER_KEY")
             or os.getenv("TOKEN_ROUTER_API_KEY", ""),
         }
@@ -86,12 +152,50 @@ class DaytonaSandboxManager:
             "model": os.getenv("CODEX_MODEL", DEFAULT_CODEX_MODEL),
             "provider_base_url": os.getenv("CODEX_BASE_URL", DEFAULT_OPENROUTER_URL),
             "repository": self.repository,
-            "ide": (
-                {key: value for key, value in self.ide.items() if key != "url"}
-                if self.ide
-                else None
-            ),
+            "ide": self._ide_update(),
+            "docker": self.docker,
         }
+
+    def _ide_update(self) -> dict[str, Any]:
+        """Builds the IDE state, carrying a signed preview URL forward only while it is valid.
+
+        The token is embedded in the preview URL, so it is safe for the browser to
+        fetch directly, but it stays server-side until it is certain to be usable.
+        """
+        if self.ide is None:
+            ide: dict[str, Any] = {"running": False}
+        else:
+            ide = dict(self.ide)
+
+        preview = self._ide_preview
+        fresh = bool(
+            preview
+            and preview.get("url")
+            and preview.get("expires_at")
+            and datetime.now(timezone.utc)
+            + timedelta(seconds=60)
+            < datetime.fromisoformat(preview["expires_at"])
+        )
+        if fresh:
+            ide["url"] = preview["url"]
+            ide["expires_at"] = preview["expires_at"]
+            ide["expires_in_seconds"] = max(
+                1,
+                int(
+                    (
+                        datetime.fromisoformat(preview["expires_at"])
+                        - datetime.now(timezone.utc)
+                    ).total_seconds()
+                ),
+            )
+        else:
+            if self.ide is not None:
+                ide["url"] = None
+                ide["unavailable_reason"] = (
+                    "The VS Code preview link expired. Launch VS Code again for a "
+                    "fresh link."
+                )
+        return ide
 
     @staticmethod
     def _validate_repo_url(repo_url: str) -> str:
@@ -145,29 +249,60 @@ class DaytonaSandboxManager:
         with self._lock:
             if self.sandbox is not None:
                 return self.status()
-
-            try:
-                from daytona import Daytona, DaytonaConfig
-            except ImportError as exc:
-                raise RuntimeError(
-                    "The Daytona Python SDK is not installed"
-                ) from exc
-
-            api_key = os.getenv("DAYTONA_API_KEY")
-            if not api_key:
-                raise RuntimeError("DAYTONA_API_KEY is not configured")
-
-            # This is intentionally the same client initialization shape as the
-            # Daytona quickstart, while keeping the key in Replit Secrets.
-            config = DaytonaConfig(api_key=api_key)
-            self.daytona = Daytona(config)
-            self.sandbox = self.daytona.create()
+            # Reattach to the persisted sandbox first: Daytona caps total disk, so
+            # creating a fresh sandbox per restart exhausts the quota.
+            if self.sandbox_id:
+                try:
+                    return self.attach(self.sandbox_id)
+                except Exception:
+                    logger.warning(
+                        "Could not reattach to sandbox %s; creating a new one.",
+                        self.sandbox_id,
+                        exc_info=True,
+                    )
+                    self.sandbox_id = None
+            client = self._client()
+            self.sandbox = client.create()
             self.sandbox_id = str(
                 getattr(self.sandbox, "id", None)
                 or getattr(self.sandbox, "sandbox_id", None)
                 or "created"
             )
+            self._persist_sandbox_id()
             self._record("system", "Daytona sandbox created.", 0)
+            return self.status()
+
+    def _client(self) -> Any:
+        """Builds the Daytona client, reusing it when the manager already has one."""
+        try:
+            from daytona import Daytona, DaytonaConfig
+        except ImportError as exc:
+            raise RuntimeError(
+                "The Daytona Python SDK is not installed"
+            ) from exc
+
+        api_key = os.getenv("DAYTONA_API_KEY")
+        if not api_key:
+            raise RuntimeError("DAYTONA_API_KEY is not configured")
+
+        # This is intentionally the same client initialization shape as the
+        # Daytona quickstart, while keeping the key in Replit Secrets.
+        if self.daytona is None:
+            self.daytona = Daytona(DaytonaConfig(api_key=api_key))
+        return self.daytona
+
+    def attach(self, sandbox_id: str | None = None) -> dict[str, Any]:
+        """Reattaches to an existing sandbox, which avoids leaking a new one per restart."""
+        with self._lock:
+            target = (sandbox_id or self.sandbox_id or "").strip()
+            if not target:
+                raise ValueError("No sandbox id is known; create a sandbox first.")
+            if not re.fullmatch(r"[A-Za-z0-9-]{16,64}", target):
+                raise ValueError("Sandbox id must be a UUID-like identifier.")
+            self.sandbox = self._client().get(target)
+            self.sandbox_id = target
+            self._persist_sandbox_id()
+            self._record("system", f"Attached to Daytona sandbox {target}.", 0)
             return self.status()
 
     def _code_run(self, code: str, kind: str) -> dict[str, Any]:
@@ -273,25 +408,65 @@ raise SystemExit(0 if all(code == 0 for code in critical_exit_codes) else 1)
 import json
 import os
 import shutil
-import signal
+import socket
 import subprocess
 import time
+import urllib.error
 import urllib.request
 
 home = {home_json}
 default_folder = {folder_json}
+preferred_port = {IDE_PORT_DEFAULT}
+scan_range = {IDE_PORT_SCAN_RANGE}
+ready_timeout = {IDE_READY_TIMEOUT_SECONDS}
 install_root = os.path.join(home, ".openvscode-server")
 binary = os.path.join(install_root, "bin", "openvscode-server")
 pid_file = os.path.join(home, ".openvscode-server.pid")
 log_file = os.path.join(home, ".openvscode-server.log")
+profile_file = os.path.join(home, ".openvscode-server.env")
 
-def running_pid():
+def port_in_use(port):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.settimeout(0.5)
+        return probe.connect_ex(("127.0.0.1", port)) == 0
+
+def port_is_bindable(port):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            probe.bind(("0.0.0.0", port))
+            return True
+        except OSError:
+            return False
+
+def pick_port():
+    for candidate in range(preferred_port, preferred_port + scan_range):
+        if port_is_bindable(candidate):
+            return candidate
+    return None
+
+def read_state():
     try:
         with open(pid_file, "r", encoding="utf-8") as file:
-            pid = int(file.read().strip())
-        os.kill(pid, 0)
-        return pid
-    except (OSError, ValueError, FileNotFoundError):
+            state = json.loads(file.read().strip())
+        return state if isinstance(state, dict) else {{}}
+    except (OSError, ValueError):
+        return {{}}
+
+def alive(pid, port):
+    try:
+        os.kill(int(pid), 0)
+    except (OSError, TypeError, ValueError):
+        return False
+    return bool(port) and port_in_use(int(port))
+
+def http_code(port, path="/", timeout=3):
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:%d%s" % (port, path), timeout=timeout) as response:
+            return response.status
+    except urllib.error.HTTPError as error:
+        return error.code
+    except Exception:
         return None
 
 if not os.path.exists(binary):
@@ -347,15 +522,25 @@ if not os.path.exists(binary):
     shutil.rmtree(extract_root, ignore_errors=True)
     os.remove(archive)
 
-pid = running_pid()
-if not pid:
+state = read_state()
+pid = state.get("pid")
+port = state.get("port")
+
+# Reuse a healthy server; otherwise start one on the first port the agent is not holding.
+if not (alive(pid, port) and http_code(int(port)) is not None):
+    port = pick_port()
+    if port is None:
+        print(json.dumps({{"error": "No free port was available in the sandbox for the VS Code server."}}))
+        raise SystemExit(1)
     os.makedirs(os.path.dirname(log_file), exist_ok=True)
     log = open(log_file, "a", encoding="utf-8")
     process = subprocess.Popen(
         [
             binary,
             "--host", "0.0.0.0",
-            "--port", "2280",
+            "--port", str(port),
+            # The preview token authenticates every request, so the server itself
+            # does not need its own connection token.
             "--without-connection-token",
             "--default-folder", default_folder,
         ],
@@ -364,46 +549,326 @@ if not pid:
         start_new_session=True,
         env=os.environ.copy(),
     )
-    with open(pid_file, "w", encoding="utf-8") as file:
-        file.write(str(process.pid))
-    time.sleep(2)
-    if process.poll() is not None:
-        print(json.dumps({{"error": "openvscode-server exited during startup."}}))
-        raise SystemExit(1)
     pid = process.pid
+    with open(pid_file, "w", encoding="utf-8") as file:
+        file.write(json.dumps({{"pid": pid, "port": port}}))
+
+    deadline = time.time() + ready_timeout
+    code = http_code(port)
+    while code is None and process.poll() is None and time.time() < deadline:
+        time.sleep(1)
+        code = http_code(port)
+    if code is None:
+        with open(log_file, encoding="utf-8", errors="replace") as handle:
+            tail = handle.read()[-3000:]
+        print(json.dumps({{
+            "error": "openvscode-server did not answer on port %d." % port,
+            "log_tail": tail,
+        }}))
+        raise SystemExit(1)
+
+    # VS Code terminals inherit this, and code-server forces its own port when it
+    # cannot rebind the one it was given.
+    try:
+        with open(profile_file, "w", encoding="utf-8") as handle:
+            handle.write("IDE_PORT=%d\\nexport IDE_PORT\\n" % port)
+    except OSError:
+        pass
 
 print(json.dumps({{
     "installed": os.path.exists(binary),
     "running": bool(pid),
     "pid": pid,
-    "port": 2280,
+    "port": port,
     "folder": default_folder,
 }}))
 """
             result = self._code_run(ide_code, "ide-start")
-            if result["exit_code"] != 0:
-                raise RuntimeError(result["result"] or "VS Code server failed to start.")
             try:
                 details = json.loads(result["result"].splitlines()[-1])
             except (ValueError, IndexError) as exc:
-                raise RuntimeError("VS Code server returned an invalid result.") from exc
-            if "error" in details:
-                raise RuntimeError(details["error"])
-            preview = self.sandbox.create_signed_preview_url(
-                2280, expires_in_seconds=3600
-            )
-            preview_url = str(getattr(preview, "url", preview))
+                raise RuntimeError(
+                    result["result"] or "VS Code server failed to start."
+                ) from exc
+            if result["exit_code"] != 0 or "error" in details:
+                raise RuntimeError(details.get("error") or "VS Code server failed to start.")
+            port = int(details["port"])
+            # Reuse the current link when it still points at the running server;
+            # minting a new one would orphan a live token on every launch click.
+            preview = self._ide_preview
+            if (
+                not (
+                    preview
+                    and preview.get("port") == port
+                    and preview.get("expires_at")
+                    and datetime.now(timezone.utc) + timedelta(seconds=60)
+                    < datetime.fromisoformat(preview["expires_at"])
+                )
+            ):
+                signed = self.sandbox.create_signed_preview_url(
+                    port, expires_in_seconds=IDE_PREVIEW_TTL_SECONDS
+                )
+                preview = {
+                    "url": str(signed.url),
+                    "port": port,
+                    "expires_at": (
+                        datetime.now(timezone.utc)
+                        + timedelta(seconds=IDE_PREVIEW_TTL_SECONDS)
+                    ).isoformat(),
+                }
+                self._ide_preview = preview
             self.ide = {
                 "provider": "openvscode-server",
-                "port": 2280,
+                "port": port,
                 "running": True,
-                "url": preview_url,
-                "expires_in_seconds": 3600,
                 "folder": details.get("folder"),
             }
-            return {"status": self.status(), "ide": self.ide, "run": result}
+            return {"status": self.status(), "ide": self.status()["ide"], "run": result}
+
+    def start_docker(self) -> dict[str, Any]:
+        """Installs and starts dockerd inside the sandbox. Requires ENABLE_DOCKER."""
+        with self._lock:
+            if not self._docker_enabled():
+                raise ValueError(
+                    "Docker is disabled. Set ENABLE_DOCKER=true to expose containers "
+                    "to the sandbox."
+                )
+            if self.sandbox is None:
+                self.create()
+            assert self.sandbox is not None
+
+            code = r"""
+import json
+import os
+import shutil
+import subprocess
+import time
+
+def run(command, timeout=120, sudo=False):
+    prefix = ["sudo", "-n"] if sudo else []
+    return subprocess.run(prefix + command, capture_output=True, text=True,
+                          timeout=timeout, check=False)
+
+def docker_ready():
+    probe = run(["docker", "info"], timeout=30)
+    return probe.returncode == 0
+
+if shutil.which("docker") is None or shutil.which("dockerd") is None:
+    installer = run(["sh", "-lc",
+        "apt-get update -y -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq docker.io"],
+        timeout=900, sudo=True)
+    if installer.returncode:
+        print(json.dumps({"error": installer.stderr[-4000:] or installer.stdout[-4000:]}))
+        raise SystemExit(1)
+
+# The socket group lets the unprivileged sandbox user drive Docker without sudo,
+# which keeps Codex's workspace-write sandbox usable.
+user = subprocess.run(["id", "-un"], capture_output=True, text=True).stdout.strip() or "daytona"
+if not docker_ready():
+    run(["pkill", "-f", "dockerd"], timeout=30, sudo=True)
+    time.sleep(3)
+    log = open("/tmp/dockerd.log", "a", encoding="utf-8")
+    process = subprocess.Popen(
+        ["sudo", "-n", "dockerd", "-G", user],
+        stdout=log, stderr=subprocess.STDOUT,
+        start_new_session=True, stdin=subprocess.DEVNULL,
+    )
+    deadline = time.time() + 120
+    while time.time() < deadline and not docker_ready():
+        time.sleep(2)
+    if not docker_ready():
+        with open("/tmp/dockerd.log", encoding="utf-8", errors="replace") as handle:
+            tail = handle.read()[-3000:]
+        print(json.dumps({"error": "dockerd did not become ready.", "log_tail": tail}))
+        raise SystemExit(1)
+
+version = run(["docker", "version", "--format", "{{.Server.Version}}"], timeout=30)
+print(json.dumps({
+    "installed": True,
+    "running": True,
+    "version": version.stdout.strip(),
+    "socket_group": user,
+}))
+"""
+            result = self._code_run(code, "docker-start")
+            try:
+                details = json.loads(result["result"].splitlines()[-1])
+            except (ValueError, IndexError) as exc:
+                raise RuntimeError(
+                    result["result"] or "Docker failed to start."
+                ) from exc
+            if result["exit_code"] != 0 or "error" in details:
+                raise RuntimeError(details.get("error") or "Docker failed to start.")
+            self.docker = {
+                "installed": True,
+                "running": True,
+                "version": details.get("version") or "",
+                "socket_group": details.get("socket_group"),
+            }
+            return {"status": self.status(), "docker": self.docker, "run": result}
+
+    @staticmethod
+    def _validate_image(image: str) -> str:
+        value = image.strip()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*(?::[A-Za-z0-9._-]+)?", value):
+            raise ValueError("Image must be a Docker image reference.")
+        return value
+
+    def list_containers(self) -> dict[str, Any]:
+        with self._lock:
+            if self.sandbox is None or not (self.docker or {}).get("running"):
+                return {"docker": self.docker, "containers": []}
+            result = self.sandbox.process.exec(
+                "docker ps -a --format '{{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}'",
+                timeout=60,
+            )
+            containers = []
+            for line in (result.result or "").splitlines():
+                parts = line.split("\t")
+                if len(parts) >= 3:
+                    containers.append(
+                        {
+                            "name": parts[0],
+                            "image": parts[1],
+                            "status": parts[2],
+                            "ports": parts[3] if len(parts) > 3 else "",
+                        }
+                    )
+            return {"docker": self.docker, "containers": containers}
+
+    def run_container(
+        self,
+        image: str,
+        command: str | None,
+        name: str,
+        ports: list[int],
+        env: dict[str, str] | None = None,
+        volumes: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        with self._lock:
+            if not self._docker_enabled():
+                raise ValueError("Docker is disabled. Set ENABLE_DOCKER=true first.")
+            if not (self.docker or {}).get("running"):
+                self.start_docker()
+            assert self.sandbox is not None
+            if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]*", name):
+                raise ValueError("Container name must be a simple identifier.")
+            for port in ports:
+                if not 1 <= port <= 65535:
+                    raise ValueError("Ports must be between 1 and 65535.")
+
+            image_ref = self._validate_image(image)
+            launch = ["docker", "run", "-d", "--name", name]
+            for port in ports:
+                launch += ["-p", f"{port}:{port}"]
+            for key, value in (env or {}).items():
+                if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+                    raise ValueError("Environment variable names must be simple identifiers.")
+                launch += ["-e", f"{key}={value}"]
+            for volume, target in (volumes or {}).items():
+                if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]*", volume):
+                    raise ValueError("Volume names must be simple identifiers.")
+                if not target.startswith("/") or ".." in target:
+                    raise ValueError("Volume targets must be absolute paths.")
+                launch += ["-v", f"{volume}:{target}"]
+            launch.append(image_ref)
+
+            # Pull before inspecting: an absent image makes inspect fail, and the
+            # container would then start with the wrong command shape.
+            pull = self.sandbox.process.exec(
+                f"docker pull {shlex.quote(image_ref)}", timeout=1800
+            )
+            if pull.exit_code != 0:
+                raise RuntimeError((pull.result or "").strip() or "docker pull failed.")
+
+            if command:
+                # Match `docker run <image> <args>`: an image built with a shell
+                # entrypoint (bash -c) takes the command as one argument, while a
+                # plain image needs it run through a shell. Only the entrypoint is
+                # fetched, and the format string is concatenated rather than
+                # interpolated: an f-string would collapse the template braces.
+                inspected = self.sandbox.process.exec(
+                    "docker image inspect "
+                    + shlex.quote(image_ref)
+                    + " --format '{{json .Config.Entrypoint}}'",
+                    timeout=120,
+                )
+                try:
+                    entrypoint = json.loads((inspected.result or "").strip() or "[]")
+                except ValueError:
+                    entrypoint = []
+                shell_entrypoint = bool(entrypoint) and str(entrypoint[-1]).strip() in {
+                    "-c",
+                    "-lc",
+                }
+                if shell_entrypoint:
+                    launch.append(command)
+                else:
+                    launch += ["sh", "-lc", command]
+
+            # Replace any previous container with the same name so relaunches work.
+            self.sandbox.process.exec(
+                f"docker rm -f {shlex.quote(name)}", timeout=120
+            )
+            result = self.sandbox.process.exec(
+                " ".join(shlex.quote(part) for part in launch), timeout=900
+            )
+            if result.exit_code != 0:
+                # Surface the daemon's message, including a name collision.
+                detail = (result.result or "").strip()
+                raise RuntimeError(detail or "docker run failed.")
+
+            logs = self.sandbox.process.exec(
+                f"docker logs --tail 40 {shlex.quote(name)} 2>&1", timeout=60
+            )
+            previews: dict[str, Any] = {}
+            for port in ports:
+                signed = self.sandbox.create_signed_preview_url(
+                    port, expires_in_seconds=CONTAINER_PREVIEW_TTL_SECONDS
+                )
+                previews[str(port)] = {
+                    "url": str(signed.url),
+                    "expires_at": (
+                        datetime.now(timezone.utc)
+                        + timedelta(seconds=CONTAINER_PREVIEW_TTL_SECONDS)
+                    ).isoformat(),
+                }
+            self._container_previews[name] = previews
+            details = {
+                "name": name,
+                "image": image,
+                "command": command,
+                "ports": ports,
+                "previews": previews,
+                "logs": (logs.result or "")[-4000:],
+            }
+            return {
+                "status": self.status(),
+                "container": details,
+                "run": self._record("docker", f"Started container {name}.", 0),
+            }
+
+    def stop_container(self, name: str) -> dict[str, Any]:
+        with self._lock:
+            if self.sandbox is None:
+                raise ValueError("No sandbox has been created yet.")
+            if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]*", name):
+                raise ValueError("Container name must be a simple identifier.")
+            result = self.sandbox.process.exec(
+                f"docker rm -f {shlex.quote(name)}", timeout=180
+            )
+            if result.exit_code != 0:
+                raise RuntimeError((result.result or "").strip() or "docker rm failed.")
+            self._container_previews.pop(name, None)
+            return {
+                "status": self.status(),
+                "run": self._record("docker", f"Stopped container {name}.", 0),
+            }
 
     def prompt(self, prompt: str, timeout_seconds: int) -> dict[str, Any]:
+        # Only the bootstrap check holds the lock: a Codex run can take
+        # minutes, and holding the manager lock that long wedges every
+        # other route behind this request.
         with self._lock:
             if not self.bootstrap_complete:
                 bootstrap_result = self.bootstrap()
@@ -418,15 +883,16 @@ print(json.dumps({{
                         ),
                     }
 
-            settings = self._settings()
-            prompt_json = json.dumps(prompt)
-            base_url_json = json.dumps(settings["provider_url"])
-            key_json = json.dumps(settings["provider_key"])
-            model_json = json.dumps(settings["model"])
-            repo_path_json = json.dumps(
-                self.repository["path"] if self.repository else ""
-            )
-            code = f"""
+        settings = self._settings()
+        prompt_json = json.dumps(prompt)
+        base_url_json = json.dumps(settings["provider_url"])
+        key_json = json.dumps(settings["provider_key"])
+        model_json = json.dumps(settings["model"])
+        codex_sandbox_json = json.dumps(settings["codex_sandbox"])
+        repo_path_json = json.dumps(
+            self.repository["path"] if self.repository else ""
+        )
+        code = f"""
 import os
 import subprocess
 
@@ -439,7 +905,7 @@ environment["CODEX_MODEL"] = {model_json}
 command = [
     "codex", "exec",
     "--skip-git-repo-check",
-    "--sandbox", "workspace-write",
+    "--sandbox", {codex_sandbox_json},
     "--config", 'model_provider="openrouter"',
     "--config", 'model_providers.openrouter.name="OpenRouter"',
     "--config", "model_providers.openrouter.base_url=" + {base_url_json},
@@ -464,10 +930,10 @@ if completed.stderr:
     print(completed.stderr, end="")
 raise SystemExit(completed.returncode)
 """
-            return {
-                "status": self.status(),
-                "run": self._code_run(code, "codex"),
-            }
+        return {
+            "status": self.status(),
+            "run": self._code_run(code, "codex"),
+        }
 
     def clone_repository(
         self, repo_url: str, branch: str | None, replace_existing: bool
@@ -694,6 +1160,17 @@ def create_sandbox() -> dict[str, Any]:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
+@app.post("/api/sandbox/attach")
+def attach_sandbox(request: AttachRequest) -> dict[str, Any]:
+    try:
+        return manager.attach(request.sandbox_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Sandbox attach failed")
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
 @app.post("/api/sandbox/bootstrap")
 def bootstrap_sandbox() -> dict[str, Any]:
     try:
@@ -718,6 +1195,55 @@ def start_sandbox_ide() -> dict[str, Any]:
         return manager.start_ide()
     except Exception as exc:
         logger.exception("VS Code server failed to start")
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.post("/api/sandbox/docker")
+def start_sandbox_docker() -> dict[str, Any]:
+    try:
+        return manager.start_docker()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Docker failed to start")
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.get("/api/sandbox/containers")
+def list_sandbox_containers() -> dict[str, Any]:
+    try:
+        return manager.list_containers()
+    except Exception as exc:
+        logger.exception("Container listing failed")
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.post("/api/sandbox/containers")
+def run_sandbox_container(request: ContainerRequest) -> dict[str, Any]:
+    try:
+        return manager.run_container(
+            request.image,
+            request.command,
+            request.name,
+            request.ports,
+            request.env,
+            request.volumes,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Container start failed")
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.post("/api/sandbox/containers/stop")
+def stop_sandbox_container(request: ContainerStopRequest) -> dict[str, Any]:
+    try:
+        return manager.stop_container(request.name)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Container stop failed")
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
@@ -889,9 +1415,18 @@ CONSOLE_HTML = """<!doctype html>
       $("view-ide").classList.toggle("active", ide);
     }
     function applyIde(ide) {
-      const available = Boolean(ide && ide.running && ide.url);
+      const running = Boolean(ide && ide.running);
+      const available = Boolean(running && ide.url);
       $("view-ide").disabled = !available;
-      $("start-ide").textContent = available ? "Open VS Code" : "Launch VS Code";
+      $("start-ide").textContent = running ? "Open VS Code" : "Launch VS Code";
+      if (ide && !available) {
+        $("ide-frame").hidden = true;
+        $("ide-frame").removeAttribute("src");
+        state.ideUrl = null;
+        $("ide-empty").hidden = false;
+        $("ide-empty").innerHTML = `<div><strong>VS Code preview is not available</strong>${escapeHtml(ide.unavailable_reason || "Launch VS Code to create a preview link.")}</div>`;
+        if (running) setView("code");
+      }
       if (available && ide.url !== state.ideUrl) {
         state.ideUrl = ide.url;
         $("ide-frame").src = ide.url;
@@ -932,7 +1467,7 @@ CONSOLE_HTML = """<!doctype html>
     $("clone").onclick = () => busy($("clone"), async () => { const data = await call("/workspace/repository", {method:"POST", body:JSON.stringify({repo_url:$("repo-url").value, branch:$("branch").value || null, replace_existing:$("replace-repo").checked})}); state.entries = (await call("/workspace/tree")).entries; renderTree(); addMessage("system", "Repository cloned into the Daytona sandbox.", data.run && data.run.result); return data; });
     $("create").onclick = () => busy($("create"), () => call("/sandbox", {method:"POST", body:"{}"}));
     $("bootstrap").onclick = () => busy($("bootstrap"), () => call("/sandbox/bootstrap", {method:"POST", body:"{}"}));
-    $("start-ide").onclick = () => busy($("start-ide"), async () => { const data = await call("/sandbox/ide", {method:"POST", body:"{}"}); applyIde(data.ide); setView("ide"); addMessage("system", "Open VS Code is running in the Daytona sandbox."); return data; });
+    $("start-ide").onclick = () => busy($("start-ide"), async () => { const data = await call("/sandbox/ide", {method:"POST", body:"{}"}); applyIde(data.ide); if (data.ide && data.ide.url) { setView("ide"); addMessage("system", "Open VS Code is running in the Daytona sandbox."); } else { addMessage("system", (data.ide && data.ide.unavailable_reason) || "Open VS Code is running, but no preview link was issued."); } return data; });
     $("view-code").onclick = () => setView("code");
     $("view-ide").onclick = () => { if (!$("view-ide").disabled) setView("ide"); };
     $("refresh").onclick = refresh; $("reload-tree").onclick = async () => { try { state.entries = (await call("/workspace/tree")).entries; renderTree(); } catch (error) { addMessage("system", error.message); } };
